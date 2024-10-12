@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -14,8 +15,20 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
+    "math/rand"
 )
+
+const DefaultInstructModel = "gpt-3.5-turbo-instruct"
+
+const StableCodeModelPrefix = "stable-code"
+
+const DeepSeekCoderModel = "deepseek-coder"
+
+var SiliconflowModels = []string{"deepseek-ai/DeepSeek-V2.5", "deepseek-ai/DeepSeek-Coder-V2-Instruct", "Qwen/Qwen2.5-Coder-7B-Instruct"}
 
 type config struct {
 	Bind                 string            `json:"bind"`
@@ -25,16 +38,27 @@ type config struct {
 	CodexApiKey          string            `json:"codex_api_key"`
 	CodexApiOrganization string            `json:"codex_api_organization"`
 	CodexApiProject      string            `json:"codex_api_project"`
+	CodexMaxTokens       int               `json:"codex_max_tokens"`
+	CodeInstructModel    string            `json:"code_instruct_model"`
 	ChatApiBase          string            `json:"chat_api_base"`
 	ChatApiKey           string            `json:"chat_api_key"`
 	ChatApiOrganization  string            `json:"chat_api_organization"`
 	ChatApiProject       string            `json:"chat_api_project"`
+	ChatMaxTokens        int               `json:"chat_max_tokens"`
 	ChatModelDefault     string            `json:"chat_model_default"`
 	ChatModelMap         map[string]string `json:"chat_model_map"`
+	ChatLocale           string            `json:"chat_locale"`
+	AuthToken            string            `json:"auth_token"`
 }
 
 func readConfig() *config {
-	content, err := os.ReadFile("config.json")
+	var configPath string
+	if len(os.Args) > 1 {
+		configPath = os.Args[1]
+	} else {
+		configPath = "config.json"
+	}
+	content, err := os.ReadFile(configPath)
 	if nil != err {
 		log.Fatal(err)
 	}
@@ -43,6 +67,54 @@ func readConfig() *config {
 	err = json.Unmarshal(content, &_cfg)
 	if nil != err {
 		log.Fatal(err)
+	}
+
+	v := reflect.ValueOf(_cfg).Elem()
+	t := v.Type()
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		tag := t.Field(i).Tag.Get("json")
+		if tag == "" {
+			continue
+		}
+
+		value, exists := os.LookupEnv("OVERRIDE_" + strings.ToUpper(tag))
+		if !exists {
+			continue
+		}
+
+		switch field.Kind() {
+		case reflect.String:
+			field.SetString(value)
+		case reflect.Bool:
+			if boolValue, err := strconv.ParseBool(value); err == nil {
+				field.SetBool(boolValue)
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			if intValue, err := strconv.ParseInt(value, 10, 64); err == nil {
+				field.SetInt(intValue)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			if uintValue, err := strconv.ParseUint(value, 10, 64); err == nil {
+				field.SetUint(uintValue)
+			}
+		case reflect.Float32, reflect.Float64:
+			if floatValue, err := strconv.ParseFloat(value, field.Type().Bits()); err == nil {
+				field.SetFloat(floatValue)
+			}
+		}
+	}
+	if _cfg.CodeInstructModel == "" {
+		_cfg.CodeInstructModel = DefaultInstructModel
+	}
+
+	if _cfg.CodexMaxTokens == 0 {
+		_cfg.CodexMaxTokens = 500
+	}
+
+	if _cfg.ChatMaxTokens == 0 {
+		_cfg.ChatMaxTokens = 4096
 	}
 
 	return _cfg
@@ -106,10 +178,214 @@ func NewProxyService(cfg *config) (*ProxyService, error) {
 		client: client,
 	}, nil
 }
+func AuthMiddleware(authToken string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.Param("token")
+		if token != authToken {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
 
 func (s *ProxyService) InitRoutes(e *gin.Engine) {
-	e.POST("/v1/chat/completions", s.completions)
-	e.POST("/v1/engines/copilot-codex/completions", s.codeCompletions)
+	e.GET("/_ping", s.pong)
+	e.GET("/models", s.models)
+	e.GET("/v1/models", s.models)
+	authToken := s.cfg.AuthToken // replace with your dynamic value as needed
+	if authToken != "" {
+		// 鉴权
+		v1 := e.Group("/:token/v1/", AuthMiddleware(authToken))
+		{
+			v1.POST("/chat/completions", s.completions)
+			v1.POST("/engines/copilot-codex/completions", s.codeCompletions)
+
+			v1.POST("/v1/chat/completions", s.completions)
+			v1.POST("/v1/engines/copilot-codex/completions", s.codeCompletions)
+		}
+	} else {
+		e.POST("/v1/chat/completions", s.completions)
+		e.POST("/v1/engines/copilot-codex/completions", s.codeCompletions)
+
+		e.POST("/v1/v1/chat/completions", s.completions)
+		e.POST("/v1/v1/engines/copilot-codex/completions", s.codeCompletions)
+	}
+}
+
+type Pong struct {
+	Now    int    `json:"now"`
+	Status string `json:"status"`
+	Ns1    string `json:"ns1"`
+}
+
+func (s *ProxyService) pong(c *gin.Context) {
+	c.JSON(http.StatusOK, Pong{
+		Now:    time.Now().Second(),
+		Status: "ok",
+		Ns1:    "200 OK",
+	})
+}
+
+func (s *ProxyService) models(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"data": []gin.H{
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-3.5-turbo",
+					"limits":    gin.H{"max_prompt_tokens": 12288},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"tool_calls": true},
+					"tokenizer": "cl100k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-3.5-turbo",
+				"name":    "GPT 3.5 Turbo",
+				"object":  "model",
+				"version": "gpt-3.5-turbo-0613",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-3.5-turbo",
+					"limits":    gin.H{"max_prompt_tokens": 12288},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"tool_calls": true},
+					"tokenizer": "cl100k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-3.5-turbo-0613",
+				"name":    "GPT 3.5 Turbo",
+				"object":  "model",
+				"version": "gpt-3.5-turbo-0613",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-4",
+					"limits":    gin.H{"max_prompt_tokens": 20000},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"tool_calls": true},
+					"tokenizer": "cl100k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-4",
+				"name":    "GPT 4",
+				"object":  "model",
+				"version": "gpt-4-0613",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-4",
+					"limits":    gin.H{"max_prompt_tokens": 20000},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"tool_calls": true},
+					"tokenizer": "cl100k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-4-0613",
+				"name":    "GPT 4",
+				"object":  "model",
+				"version": "gpt-4-0613",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-4-turbo",
+					"limits":    gin.H{"max_prompt_tokens": 20000},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"parallel_tool_calls": true, "tool_calls": true},
+					"tokenizer": "cl100k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-4-0125-preview",
+				"name":    "GPT 4 Turbo",
+				"object":  "model",
+				"version": "gpt-4-0125-preview",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-4o",
+					"limits":    gin.H{"max_prompt_tokens": 20000},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"parallel_tool_calls": true, "tool_calls": true},
+					"tokenizer": "o200k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-4o",
+				"name":    "GPT 4o",
+				"object":  "model",
+				"version": "gpt-4o-2024-05-13",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-4o",
+					"limits":    gin.H{"max_prompt_tokens": 20000},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"parallel_tool_calls": true, "tool_calls": true},
+					"tokenizer": "o200k_base",
+					"type":      "chat",
+				},
+				"id":      "gpt-4o-2024-05-13",
+				"name":    "GPT 4o",
+				"object":  "model",
+				"version": "gpt-4o-2024-05-13",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "gpt-4o",
+					"limits":    gin.H{"max_prompt_tokens": 20000},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"parallel_tool_calls": true, "tool_calls": true},
+					"tokenizer": "o200k_base",
+					"type":      "chat",
+				},
+				"id":     "gpt-4-o-preview",
+				"name":   "GPT 4o",
+				"object": "model",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "text-embedding-ada-002",
+					"limits":    gin.H{"max_inputs": 256},
+					"object":    "model_capabilities",
+					"supports":  gin.H{},
+					"tokenizer": "cl100k_base",
+					"type":      "embeddings",
+				},
+				"id":      "text-embedding-ada-002",
+				"name":    "Embedding V2 Ada",
+				"object":  "model",
+				"version": "text-embedding-ada-002",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "text-embedding-3-small",
+					"limits":    gin.H{"max_inputs": 256},
+					"object":    "model_capabilities",
+					"supports":  gin.H{"dimensions": true},
+					"tokenizer": "cl100k_base",
+					"type":      "embeddings",
+				},
+				"id":      "text-embedding-3-small",
+				"name":    "Embedding V3 small",
+				"object":  "model",
+				"version": "text-embedding-3-small",
+			},
+			{
+				"capabilities": gin.H{
+					"family":    "text-embedding-3-small",
+					"object":    "model_capabilities",
+					"supports":  gin.H{"dimensions": true},
+					"tokenizer": "cl100k_base",
+					"type":      "embeddings",
+				},
+				"id":      "text-embedding-3-small-inference",
+				"name":    "Embedding V3 small (Inference)",
+				"object":  "model",
+				"version": "text-embedding-3-small",
+			},
+		},
+		"object": "list",
+	})
 }
 
 func (s *ProxyService) completions(c *gin.Context) {
@@ -128,7 +404,32 @@ func (s *ProxyService) completions(c *gin.Context) {
 		model = s.cfg.ChatModelDefault
 	}
 	body, _ = sjson.SetBytes(body, "model", model)
+
+	if !gjson.GetBytes(body, "function_call").Exists() {
+		messages := gjson.GetBytes(body, "messages").Array()
+		for i, msg := range messages {
+			toolCalls := msg.Get("tool_calls").Array()
+			if len(toolCalls) == 0 {
+				body, _ = sjson.DeleteBytes(body, fmt.Sprintf("messages.%d.tool_calls", i))
+			}
+		}
+		lastIndex := len(messages) - 1
+		if !strings.Contains(messages[lastIndex].Get("content").String(), "Respond in the following locale") {
+			locale := s.cfg.ChatLocale
+			if locale == "" {
+				locale = "zh_CN"
+			}
+			body, _ = sjson.SetBytes(body, "messages."+strconv.Itoa(lastIndex)+".content", messages[lastIndex].Get("content").String()+"Respond in the following locale: "+locale+".")
+		}
+	}
+
 	body, _ = sjson.DeleteBytes(body, "intent")
+	body, _ = sjson.DeleteBytes(body, "intent_threshold")
+	body, _ = sjson.DeleteBytes(body, "intent_content")
+
+	if int(gjson.GetBytes(body, "max_tokens").Int()) > s.cfg.ChatMaxTokens {
+		body, _ = sjson.SetBytes(body, "max_tokens", s.cfg.ChatMaxTokens)
+	}
 
 	proxyUrl := s.cfg.ChatApiBase + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxyUrl, io.NopCloser(bytes.NewBuffer(body)))
@@ -176,10 +477,14 @@ func (s *ProxyService) completions(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
+func contains(arr []string, str string) bool {
+    return strings.Contains(strings.Join(arr, ","), str)
+}
+
 func (s *ProxyService) codeCompletions(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	if ctx.Err() != nil {
 		abortCodex(c, http.StatusRequestTimeout)
 		return
@@ -191,9 +496,7 @@ func (s *ProxyService) codeCompletions(c *gin.Context) {
 		return
 	}
 
-	body, _ = sjson.DeleteBytes(body, "extra")
-	body, _ = sjson.DeleteBytes(body, "nwo")
-	body, _ = sjson.SetBytes(body, "model", "gpt-3.5-turbo-instruct")
+	body = ConstructRequestBody(body, s.cfg)
 
 	proxyUrl := s.cfg.CodexApiBase + "/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxyUrl, io.NopCloser(bytes.NewBuffer(body)))
@@ -203,7 +506,7 @@ func (s *ProxyService) codeCompletions(c *gin.Context) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.CodexApiKey)
+	req.Header.Set("Authorization", "Bearer " + getRandomApiKey(s.cfg.CodexApiKey))
 	if "" != s.cfg.CodexApiOrganization {
 		req.Header.Set("OpenAI-Organization", s.cfg.CodexApiOrganization)
 	}
@@ -242,6 +545,68 @@ func (s *ProxyService) codeCompletions(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
+// 随机取一个apiKey
+func getRandomApiKey(paramStr string) string {
+    params := strings.Split(paramStr, ",")
+    rand.Seed(time.Now().UnixNano())
+    randomIndex := rand.Intn(len(params))
+	fmt.Println("Code completion API Key index:", randomIndex)
+	fmt.Println("Code completion API Key:", strings.TrimSpace(params[randomIndex]))
+    return strings.TrimSpace(params[randomIndex])
+}
+
+func ConstructRequestBody(body []byte, cfg *config) []byte {
+	body, _ = sjson.DeleteBytes(body, "extra")
+	body, _ = sjson.DeleteBytes(body, "nwo")
+	body, _ = sjson.SetBytes(body, "model", cfg.CodeInstructModel)
+
+	if int(gjson.GetBytes(body, "max_tokens").Int()) > cfg.CodexMaxTokens {
+		body, _ = sjson.SetBytes(body, "max_tokens", cfg.CodexMaxTokens)
+	}
+
+	if strings.Contains(cfg.CodeInstructModel, StableCodeModelPrefix) {
+		return constructWithStableCodeModel(body)
+	} else if strings.HasPrefix(cfg.CodeInstructModel, DeepSeekCoderModel) || contains(SiliconflowModels, cfg.CodeInstructModel) {
+		if gjson.GetBytes(body, "n").Int() > 1 {
+			body, _ = sjson.SetBytes(body, "n", 1)
+		}
+	}
+
+	if strings.HasSuffix(cfg.ChatApiBase, "chat") {
+		// @Todo  constructWithChatModel
+		// 如果code base以chat结尾则构建chatModel，暂时没有好的prompt
+	}
+
+	return body
+}
+
+func constructWithStableCodeModel(body []byte) []byte {
+	suffix := gjson.GetBytes(body, "suffix")
+	prompt := gjson.GetBytes(body, "prompt")
+	content := fmt.Sprintf("<fim_prefix>%s<fim_suffix>%s<fim_middle>", prompt, suffix)
+
+	// 创建新的 JSON 对象并添加到 body 中
+	messages := []map[string]string{
+		{
+			"role":    "user",
+			"content": content,
+		},
+	}
+	return constructWithChatModel(body, messages)
+}
+
+func constructWithChatModel(body []byte, messages interface{}) []byte {
+
+	body, _ = sjson.SetBytes(body, "messages", messages)
+
+	// fmt.Printf("Request Body: %s\n", body)
+	// 2. 将转义的字符替换回原来的字符
+	jsonStr := string(body)
+	jsonStr = strings.ReplaceAll(jsonStr, "\\u003c", "<")
+	jsonStr = strings.ReplaceAll(jsonStr, "\\u003e", ">")
+	return []byte(jsonStr)
+}
+
 func main() {
 	cfg := readConfig()
 
@@ -261,4 +626,5 @@ func main() {
 		log.Fatal(err)
 		return
 	}
+
 }
